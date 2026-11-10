@@ -67,6 +67,12 @@ startup.
 - Scrolling the map works with a mouse wheel or trackpad; Shift scrolls sideways.
 - Plans and Terraform's working data go to `~/Library/Caches/airgap-terraform-porter`.
   That's `%LOCALAPPDATA%` on Windows and `~/.cache` on Linux.
+- **"certificate verify failed" when staging or downloading:** python.org's Mac
+  Python ships without CA certificates. The app falls back to macOS's own
+  `/etc/ssl/cert.pem` (or `certifi` if it's installed), so this normally just
+  works. If it still fails, run **`Install Certificates.command`** in
+  `/Applications/Python 3.x/` once. Behind a TLS-inspecting proxy, add the proxy's
+  root CA to the system trust store. Certificate checks are never turned off.
 - To run the **bundle** on a Mac, build it with `darwin_arm64` (Apple Silicon)
   and/or `darwin_amd64` (Intel) ticked on the Platforms screen. The app itself
   runs either way.

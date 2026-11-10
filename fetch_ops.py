@@ -36,10 +36,12 @@ import hashlib
 import json
 import os
 import shutil
+import ssl
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
@@ -55,9 +57,63 @@ HASHICORP_KEY_URL = "https://www.hashicorp.com/.well-known/pgp-key.txt"
 
 
 # -- http --------------------------------------------------------------------
+# CA bundles to fall back on when Python's own store is empty — the python.org
+# macOS installer ships with none until "Install Certificates.command" is run.
+# Verification is never turned off; we only add the OS's trusted roots.
+_CA_FALLBACKS = (
+    "/etc/ssl/cert.pem",                         # macOS system bundle, BSD
+    "/opt/homebrew/etc/openssl@3/cert.pem",      # Homebrew (Apple silicon)
+    "/usr/local/etc/openssl@3/cert.pem",         # Homebrew (Intel)
+    "/etc/ssl/certs/ca-certificates.crt",        # Debian / Ubuntu
+    "/etc/pki/tls/certs/ca-bundle.crt",          # RHEL / Fedora
+)
+_ssl_ctx = None
+
+
+def ssl_context() -> ssl.SSLContext:
+    global _ssl_ctx
+    if _ssl_ctx is None:
+        ctx = ssl.create_default_context()
+        if not ctx.get_ca_certs() and not _has_default_cafile():
+            loaded = False
+            try:
+                import certifi                   # optional; used if present
+                ctx.load_verify_locations(certifi.where())
+                loaded = True
+            except (ImportError, OSError, ssl.SSLError):
+                pass
+            for f in _CA_FALLBACKS if not loaded else ():
+                if os.path.isfile(f):
+                    try:
+                        ctx.load_verify_locations(f)
+                        break
+                    except (OSError, ssl.SSLError):
+                        continue
+        _ssl_ctx = ctx
+    return _ssl_ctx
+
+
+def _has_default_cafile() -> bool:
+    p = ssl.get_default_verify_paths()
+    return bool((p.cafile and os.path.isfile(p.cafile)) or
+                (p.capath and os.path.isdir(p.capath) and any(os.scandir(p.capath))))
+
+
+SSL_HINT = ("Python couldn't verify the HTTPS certificate. On macOS with Python from "
+            "python.org, run 'Install Certificates.command' in "
+            "/Applications/Python 3.x/ (or `pip install certifi`), then retry. Behind a "
+            "TLS-inspecting proxy, add its root CA to the system trust store.")
+
+
 def _open(url: str, timeout=60):
     req = urllib.request.Request(url, headers={"User-Agent": UA})
-    return urllib.request.urlopen(req, timeout=timeout)  # noqa: S310 (https only)
+    try:
+        return urllib.request.urlopen(req, timeout=timeout,  # noqa: S310 (https only)
+                                      context=ssl_context())
+    except urllib.error.URLError as e:
+        if isinstance(e.reason, ssl.SSLCertVerificationError):
+            raise RuntimeError(f"{url}: {e.reason}. {SSL_HINT}") from e
+        raise RuntimeError(f"{url}: {e.reason}") from e
 
 
 def get_bytes(url: str) -> bytes:

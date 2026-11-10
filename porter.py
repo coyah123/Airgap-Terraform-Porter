@@ -280,7 +280,8 @@ def _gui():
                 try:
                     res = scan_ops.scan(root)
                 except Exception as e:                       # noqa: BLE001
-                    self.after(0, lambda: self._scan_done(None, e))
+                    # bind e now: Python deletes it when the except block ends
+                    self.after(0, lambda err=e: self._scan_done(None, err))
                     return
                 self.after(0, lambda: self._scan_done(res, None))
 
@@ -468,7 +469,8 @@ def _gui():
                     plan = bundle_ops.resolve(res, bundle, **args)
                     steps = bundle_ops.build_steps(plan)
                 except Exception as e:                       # noqa: BLE001
-                    self.after(0, lambda: self._resolved(None, None, e))
+                    # bind e now: Python deletes it when the except block ends
+                    self.after(0, lambda err=e: self._resolved(None, None, err))
                     return
                 self.after(0, lambda: self._resolved(plan, steps, None))
 

@@ -57,9 +57,15 @@ HASHICORP_KEY_URL = "https://www.hashicorp.com/.well-known/pgp-key.txt"
 
 
 # -- http --------------------------------------------------------------------
-# CA bundles to fall back on when Python's own store is empty — the python.org
-# macOS installer ships with none until "Install Certificates.command" is run.
-# Verification is never turned off; we only add the OS's trusted roots.
+# Which certificates HTTPS downloads trust. Verification is NEVER turned off;
+# we only add trusted roots that the OS already has:
+#   * macOS: the Keychain (system roots + System.keychain + your login keychain),
+#     read with Apple's /usr/bin/security. That's what Safari / curl / Terraform
+#     trust, including company proxy CAs that IT installs. python.org's macOS
+#     Python otherwise trusts nothing until "Install Certificates" is run.
+#   * anywhere, if Python's own store is still empty: certifi (if installed) or
+#     the OS bundle files below.
+#   * SSL_CERT_FILE / SSL_CERT_DIR are honoured (OpenSSL reads them).
 _CA_FALLBACKS = (
     "/etc/ssl/cert.pem",                         # macOS system bundle, BSD
     "/opt/homebrew/etc/openssl@3/cert.pem",      # Homebrew (Apple silicon)
@@ -67,28 +73,77 @@ _CA_FALLBACKS = (
     "/etc/ssl/certs/ca-certificates.crt",        # Debian / Ubuntu
     "/etc/pki/tls/certs/ca-bundle.crt",          # RHEL / Fedora
 )
+_MAC_KEYCHAINS = (
+    "/System/Library/Keychains/SystemRootCertificates.keychain",
+    "/Library/Keychains/System.keychain",        # MDM / IT-installed company CAs
+    "~/Library/Keychains/login.keychain-db",     # CAs you added yourself
+)
 _ssl_ctx = None
+ssl_sources: list[str] = []                      # shown in the startup log / errors
+
+
+def macos_keychain_pems() -> list[str]:
+    """Every certificate in the macOS keychains, as PEM blocks ([] elsewhere)."""
+    if sys.platform != "darwin" or not os.path.exists("/usr/bin/security"):
+        return []
+    pems: list[str] = []
+    for kc in _MAC_KEYCHAINS:
+        kc = os.path.expanduser(kc)
+        if not os.path.exists(kc):
+            continue
+        try:
+            out = subprocess.run(["/usr/bin/security", "find-certificate", "-a", "-p", kc],
+                                 capture_output=True, text=True, timeout=20,
+                                 stdin=subprocess.DEVNULL).stdout
+        except (OSError, subprocess.SubprocessError):
+            continue
+        pems += split_pems(out)
+    return pems
+
+
+def split_pems(text: str) -> list[str]:
+    end = "-----END CERTIFICATE-----"
+    out = []
+    for chunk in text.split(end):
+        i = chunk.find("-----BEGIN CERTIFICATE-----")
+        if i >= 0:
+            out.append(chunk[i:] + end + "\n")
+    return out
 
 
 def ssl_context() -> ssl.SSLContext:
     global _ssl_ctx
     if _ssl_ctx is None:
         ctx = ssl.create_default_context()
-        if not ctx.get_ca_certs() and not _has_default_cafile():
-            loaded = False
+        ssl_sources.clear()
+        if sys.platform == "win32":
+            ssl_sources.append("Windows certificate store")
+        elif _has_default_cafile() or ctx.get_ca_certs():
+            ssl_sources.append("Python's CA store")
+        pems = macos_keychain_pems()
+        ok = 0
+        for pem in pems:                         # one at a time: skip any odd cert
             try:
-                import certifi                   # optional; used if present
-                ctx.load_verify_locations(certifi.where())
-                loaded = True
-            except (ImportError, OSError, ssl.SSLError):
+                ctx.load_verify_locations(cadata=pem)
+                ok += 1
+            except (ssl.SSLError, ValueError):
                 pass
-            for f in _CA_FALLBACKS if not loaded else ():
-                if os.path.isfile(f):
-                    try:
-                        ctx.load_verify_locations(f)
-                        break
-                    except (OSError, ssl.SSLError):
-                        continue
+        if ok:
+            ssl_sources.append(f"macOS Keychain ({ok} certificates)")
+        if not ssl_sources:
+            try:
+                import certifi                   # optional; used only if present
+                ctx.load_verify_locations(certifi.where())
+                ssl_sources.append("certifi")
+            except (ImportError, OSError, ssl.SSLError):
+                for f in _CA_FALLBACKS:
+                    if os.path.isfile(f):
+                        try:
+                            ctx.load_verify_locations(f)
+                            ssl_sources.append(f)
+                            break
+                        except (OSError, ssl.SSLError):
+                            continue
         _ssl_ctx = ctx
     return _ssl_ctx
 
@@ -99,10 +154,47 @@ def _has_default_cafile() -> bool:
                 (p.capath and os.path.isdir(p.capath) and any(os.scandir(p.capath))))
 
 
-SSL_HINT = ("Python couldn't verify the HTTPS certificate. On macOS with Python from "
-            "python.org, run 'Install Certificates.command' in "
-            "/Applications/Python 3.x/ (or `pip install certifi`), then retry. Behind a "
-            "TLS-inspecting proxy, add its root CA to the system trust store.")
+def presented_issuer(host: str, port: int = 443) -> str:
+    """Who issued the certificate this network actually presents for host —
+    fetched WITHOUT trusting it, only to explain a failure. '' if unknown."""
+    try:
+        pem = ssl.get_server_certificate((host, port), timeout=10)
+    except TypeError:                            # Python < 3.10: no timeout kwarg
+        try:
+            pem = ssl.get_server_certificate((host, port))
+        except OSError:
+            return ""
+    except OSError:
+        return ""
+    try:
+        fd, path = tempfile.mkstemp(suffix=".pem")
+        with os.fdopen(fd, "w") as fh:
+            fh.write(pem)
+        info = ssl._ssl._test_decode_cert(path)  # stdlib decoder; display only
+        os.unlink(path)
+    except Exception:                            # noqa: BLE001
+        return ""
+    parts = dict(x[0] for x in info.get("issuer", ()))
+    return " / ".join(v for v in (parts.get("commonName"), parts.get("organizationName")) if v)
+
+
+def cert_error_message(url: str, reason) -> str:
+    host = urllib.parse.urlparse(url).hostname or url
+    issuer = presented_issuer(host)
+    trusted = ", ".join(ssl_sources) or "nothing (no CA certificates found)"
+    msg = [f"Couldn't verify the HTTPS certificate for {host} ({reason})."]
+    if issuer:
+        msg.append(f"The certificate this network presents was issued by: {issuer}.")
+    msg.append(f"The app trusts: {trusted}.")
+    if sys.platform == "darwin" and not any("Keychain" in s for s in ssl_sources):
+        msg.append("It couldn't read the macOS Keychain.")
+    msg.append("If that issuer is your company (e.g. Zscaler, Netskope, Palo Alto, "
+               "Blue Coat, or a corporate CA), a network proxy is inspecting HTTPS: "
+               "ask IT to install its root certificate in the macOS System keychain, "
+               "or save it as a .pem file and start the app with "
+               "SSL_CERT_FILE=/path/to/that.pem. Certificate checks are never "
+               "switched off.")
+    return " ".join(msg)
 
 
 def _open(url: str, timeout=60):
@@ -112,7 +204,8 @@ def _open(url: str, timeout=60):
                                       context=ssl_context())
     except urllib.error.URLError as e:
         if isinstance(e.reason, ssl.SSLCertVerificationError):
-            raise RuntimeError(f"{url}: {e.reason}. {SSL_HINT}") from e
+            raise RuntimeError(cert_error_message(url, e.reason.verify_message
+                                                  or e.reason)) from e
         raise RuntimeError(f"{url}: {e.reason}") from e
 
 
@@ -188,8 +281,8 @@ def parse_shasums(text: str) -> dict[str, str]:
 
 # -- gpg ---------------------------------------------------------------------
 def find_gpg() -> str | None:
-    """PATH of the launching terminal, then the login shell's PATH (macOS
-    Finder launches), then common folders (Git for Windows, Homebrew, GPG Suite)."""
+    """PATH of the launching terminal, then the macOS system PATH (/etc/paths,
+    read directly), then common folders (Git for Windows, Homebrew, GPG Suite)."""
     import tf_locate
     return tf_locate.find_gpg()
 

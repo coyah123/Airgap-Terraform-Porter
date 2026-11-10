@@ -141,9 +141,6 @@ def _gui():
 
             self._log(f"Host platform: {bundle_ops.host_platform()}")
             self._log_terraform()
-            g = fetch_ops.find_gpg()
-            self._log(f"gpg: {g}" if g else "⚠ gpg not found — signature checks "
-                      "will be skipped (SHA256 checks still run).")
             self.nb.select(self._screens["Scan Project"])
             self.after(120, self._drain)
 
@@ -151,8 +148,16 @@ def _gui():
             """Report the terraform the app will use (PATH of the launching
             terminal first) — found off the UI thread."""
             def work():
+                # Off the UI thread, once: the window appears immediately.
                 cands = tf_locate.find_all()
+                g = fetch_ops.find_gpg()
+                fetch_ops.ssl_context()      # loads the macOS Keychain once, here
+
                 def show():
+                    self._log("HTTPS trusts: " + (", ".join(fetch_ops.ssl_sources)
+                                                  or "⚠ no CA certificates found"))
+                    self._log(f"gpg: {g}" if g else "⚠ gpg not found — signature checks "
+                              "will be skipped (SHA256 checks still run).")
                     if cands:
                         self._log(f"terraform: {cands[0].label}")
                         for c in cands[1:]:

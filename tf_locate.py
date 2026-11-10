@@ -7,12 +7,20 @@ Search order (first hit is the default; every hit is offered as a choice):
   1. PATH      — the PATH of the terminal the app was launched from
                  (shutil.which on this process's environment). If you start
                  the app from a shell where `terraform` works, this is it.
-  2. shell     — macOS / Linux only, and only when 1 found nothing: the PATH of
-                 your login shell ($SHELL -l -c). Apps started from Finder or a
-                 desktop launcher get a minimal PATH without /opt/homebrew/bin,
-                 tfenv shims, etc.; this recovers them.
+  2. system    — macOS only, when 1 found nothing: the folders macOS's own
+                 path_helper puts on every Terminal PATH (/etc/paths and
+                 /etc/paths.d/*). Apps started from Finder get a minimal PATH;
+                 this recovers it by READING those files — no shell is started.
   3. common    — well-known install folders (Homebrew, /usr/local/bin,
-                 ~/.local/bin, tfenv, WinGet links/packages, Chocolatey, Scoop).
+                 ~/.local/bin, tfenv, asdf, mise, WinGet links/packages,
+                 Chocolatey, Scoop).
+
+Nothing here launches a shell or touches protected folders (Documents,
+Desktop, iCloud): an earlier version ran `$SHELL -l -i` to read your login
+PATH, which on macOS executed all of ~/.zshrc — slow, and it could trigger
+"would like to access…" privacy prompts. Detection runs once (cached; ⟳ in
+the UI refreshes) and `terraform version` runs with CHECKPOINT_DISABLE=1 so it
+never phones home for an update check.
   4. bundle    — <bundle>/bin/<os>_<arch>/terraform[.exe] from a porter bundle.
 
 Each candidate records where it came from and its `terraform version`, so the
@@ -28,6 +36,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -38,13 +47,13 @@ EXE = "terraform.exe" if sys.platform == "win32" else "terraform"
 @dataclass(frozen=True)
 class Candidate:
     path: str
-    source: str          # PATH | shell | common | bundle | chosen
+    source: str          # PATH | system | common | bundle | chosen
     version: str = ""    # "1.16.5" or "" if it could not be run
 
     @property
     def label(self) -> str:
         v = f"terraform {self.version}" if self.version else "terraform (version ?)"
-        where = {"PATH": "from PATH", "shell": "from login-shell PATH",
+        where = {"PATH": "from PATH", "system": "from macOS system PATH",
                  "common": "common install folder", "bundle": "from bundle",
                  "chosen": "chosen"}.get(self.source, self.source)
         return f"{v} — {where} — {self.path}"
@@ -58,33 +67,39 @@ def _kw():
 
 @lru_cache(maxsize=64)
 def terraform_version(path: str) -> str:
-    """'1.16.5' via `terraform version -json`; '' if it can't run."""
+    """'1.16.5' via `terraform version -json`; '' if it can't run.
+    CHECKPOINT_DISABLE stops terraform's online update check (which otherwise
+    waits on the network — and times out in an air gap)."""
+    env = dict(os.environ, CHECKPOINT_DISABLE="1")
     try:
         p = subprocess.run([path, "version", "-json"], capture_output=True, text=True,
-                           timeout=20, **_kw())
+                           timeout=20, env=env, stdin=subprocess.DEVNULL, **_kw())
         return json.loads(p.stdout).get("terraform_version", "")
     except (OSError, ValueError, subprocess.SubprocessError):
         return ""
 
 
 @lru_cache(maxsize=1)
-def login_shell_path() -> str:
-    """PATH as your login shell sets it (macOS / Linux). '' on Windows or failure."""
-    if sys.platform == "win32":
+def system_path() -> str:
+    """macOS: the PATH Terminal gets from path_helper — /etc/paths plus every
+    file in /etc/paths.d — read directly (no shell). '' elsewhere."""
+    if sys.platform != "darwin":
         return ""
-    shell = os.environ.get("SHELL") or ("/bin/zsh" if sys.platform == "darwin" else "/bin/bash")
-    # -l reads .zprofile/.bash_profile (Homebrew), -i also reads .zshrc/.bashrc
-    # (tfenv, asdf, mise). Markers keep any banner those files print out of it.
+    dirs: list[str] = []
+    files = [Path("/etc/paths")]
     try:
-        p = subprocess.run([shell, "-l", "-i", "-c", 'printf "@@PATH@@%s@@END@@" "$PATH"'],
-                           capture_output=True, text=True, timeout=10,
-                           stdin=subprocess.DEVNULL)
-        out = p.stdout
-        if "@@PATH@@" in out and "@@END@@" in out:
-            return out.split("@@PATH@@", 1)[1].split("@@END@@", 1)[0]
-    except (OSError, subprocess.SubprocessError):
+        files += sorted(Path("/etc/paths.d").iterdir())
+    except OSError:
         pass
-    return ""
+    for f in files:
+        try:
+            for ln in f.read_text(encoding="utf-8", errors="replace").splitlines():
+                ln = ln.strip()
+                if ln and not ln.startswith("#") and ln not in dirs:
+                    dirs.append(ln)
+        except OSError:
+            continue
+    return os.pathsep.join(dirs)
 
 
 def _common_dirs(name: str) -> list[str]:
@@ -104,7 +119,8 @@ def _common_dirs(name: str) -> list[str]:
                     os.path.join(pfx, "GnuPG", "bin")]
         return dirs
     dirs = ["/opt/homebrew/bin", "/usr/local/bin", str(home / ".local" / "bin"),
-            str(home / "bin"), str(home / ".tfenv" / "bin"), "/usr/bin", "/snap/bin"]
+            str(home / "bin"), str(home / ".tfenv" / "bin"), str(home / ".asdf" / "shims"),
+            str(home / ".local" / "share" / "mise" / "shims"), "/usr/bin", "/snap/bin"]
     if name == "gpg":
         dirs += ["/usr/local/MacGPG2/bin"]
     return dirs
@@ -118,8 +134,26 @@ def which_in(name: str, path_str: str) -> str | None:
     return shutil.which(name, path=path_str) if path_str else None
 
 
-def find_all(bundle: Path | None = None, host_platform: str = "") -> list[Candidate]:
-    """Every terraform we can find, in priority order, de-duplicated."""
+_cache: dict = {}
+_lock = threading.Lock()
+
+
+def find_all(bundle: Path | None = None, host_platform: str = "",
+             refresh: bool = False) -> list[Candidate]:
+    """Every terraform we can find, in priority order, de-duplicated. Cached:
+    the startup log and the Plan Explorer share one search; refresh=True
+    (the ⟳ button) searches again."""
+    key = (str(bundle or ""), host_platform)
+    with _lock:
+        if refresh:
+            _cache.clear()
+            terraform_version.cache_clear()
+        if key not in _cache:
+            _cache[key] = _search(bundle, host_platform)
+        return list(_cache[key])
+
+
+def _search(bundle: Path | None, host_platform: str) -> list[Candidate]:
     out: list[Candidate] = []
     seen: set[str] = set()
 
@@ -134,7 +168,7 @@ def find_all(bundle: Path | None = None, host_platform: str = "") -> list[Candid
 
     add(shutil.which("terraform"), "PATH")
     if not out:
-        add(which_in("terraform", login_shell_path()), "shell")
+        add(which_in("terraform", system_path()), "system")
     for d in _common_dirs("terraform"):
         add(os.path.join(d, _exe("terraform")), "common")
     if bundle and host_platform:
@@ -147,9 +181,10 @@ def default_terraform(bundle: Path | None = None, host_platform: str = "") -> Ca
     return c[0] if c else None
 
 
+@lru_cache(maxsize=1)
 def find_gpg() -> str | None:
-    """gpg: PATH, then login-shell PATH, then common folders."""
-    hit = shutil.which("gpg") or which_in("gpg", login_shell_path())
+    """gpg: PATH, then macOS system PATH, then common folders. Cached."""
+    hit = shutil.which("gpg") or which_in("gpg", system_path())
     if hit:
         return hit
     for d in _common_dirs("gpg"):

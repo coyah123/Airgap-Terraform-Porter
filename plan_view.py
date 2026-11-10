@@ -102,7 +102,8 @@ class PlanExplorer(ttk.Frame):
         tfb = ttk.Frame(f)
         tfb.grid(row=2, column=2, sticky="w")
         ttk.Button(tfb, text="Browse…", command=self._browse_tf).pack(side="left")
-        ttk.Button(tfb, text="⟳", width=3, command=self._detect_tf).pack(side="left")
+        ttk.Button(tfb, text="⟳", width=3,
+                   command=lambda: self._detect_tf(refresh=True)).pack(side="left")
         self.tf_status = ttk.Label(f, text="Looking for terraform…", foreground="#777")
         self.tf_status.grid(row=4, column=1, sticky="w", padx=4)
         self._tf_cands: dict[str, tf_locate.Candidate] = {}
@@ -330,14 +331,15 @@ class PlanExplorer(ttk.Frame):
         b = self.bundle_dir.get().strip() if hasattr(self, "bundle_dir") else ""
         return Path(b) if b else None
 
-    def _detect_tf(self):
+    def _detect_tf(self, refresh: bool = False):
         """Find every terraform (PATH of the launching terminal first) off the UI
-        thread, fill the dropdown, and default to the best one."""
+        thread, fill the dropdown, and default to the best one. The search is
+        cached and shared with the startup log; ⟳ passes refresh=True."""
         self.tf_status.config(text="Looking for terraform…", foreground="#777")
         bundle = self._bundle_path()
 
         def work():
-            cands = tf_locate.find_all(bundle, bundle_ops.host_platform())
+            cands = tf_locate.find_all(bundle, bundle_ops.host_platform(), refresh=refresh)
             self.after(0, lambda: self._tf_detected(cands))
         threading.Thread(target=work, daemon=True).start()
 
@@ -365,7 +367,7 @@ class PlanExplorer(ttk.Frame):
                                        "or built for another OS/CPU)", foreground="#a00")
             return
         text, color = c.label.split(" — ", 2)[0] + " — " + {
-            "PATH": "from your terminal's PATH", "shell": "from your login shell's PATH",
+            "PATH": "from your terminal's PATH", "system": "from the macOS system PATH",
             "common": "found in a common install folder", "bundle": "from the bundle",
             "chosen": "chosen by you"}.get(c.source, c.source), "#163"
         st = Path(self.stack_var.get().strip())

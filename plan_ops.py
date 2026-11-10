@@ -105,6 +105,7 @@ class RunConfig:
     def env(self) -> dict:
         env = dict(os.environ)
         env["TF_IN_AUTOMATION"] = "1"
+        env["CHECKPOINT_DISABLE"] = "1"      # no update check calls to HashiCorp
         env["TF_INPUT"] = "0"
         env.pop("TF_CLI_ARGS", None)
         env.pop("TF_CLI_ARGS_init", None)

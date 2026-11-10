@@ -50,11 +50,12 @@ log):
 
 1. **Your choice.** The Plan Explorer's Terraform dropdown, Browse…, or `--terraform` on the CLI.
 2. **The launching terminal's PATH.**
-3. **Your login shell's PATH** (macOS/Linux, when 2 found nothing). Apps started
-   from Finder or a desktop icon get a minimal PATH without Homebrew, tfenv or
-   asdf. This brings them back.
+3. **The macOS system PATH** (when 2 found nothing), read from `/etc/paths`
+   and `/etc/paths.d`, the same files Terminal uses. Apps started from Finder
+   get a minimal PATH; this brings back the standard folders. No shell is
+   started and none of your dotfiles are run.
 4. **Common install folders:** Homebrew, `/usr/local/bin`, `~/.local/bin`,
-   tfenv, WinGet, Chocolatey and Scoop.
+   tfenv, asdf, mise, WinGet, Chocolatey and Scoop.
 5. **The bundle's binary**, `bin/<os>_<arch>/terraform`, for this machine.
 
 Under the Terraform field, the Plan Explorer shows what it picked and why, e.g.
@@ -67,12 +68,19 @@ startup.
 - Scrolling the map works with a mouse wheel or trackpad; Shift scrolls sideways.
 - Plans and Terraform's working data go to `~/Library/Caches/airgap-terraform-porter`.
   That's `%LOCALAPPDATA%` on Windows and `~/.cache` on Linux.
-- **"certificate verify failed" when staging or downloading:** python.org's Mac
-  Python ships without CA certificates. The app falls back to macOS's own
-  `/etc/ssl/cert.pem` (or `certifi` if it's installed), so this normally just
-  works. If it still fails, run **`Install Certificates.command`** in
-  `/Applications/Python 3.x/` once. Behind a TLS-inspecting proxy, add the proxy's
-  root CA to the system trust store. Certificate checks are never turned off.
+- **HTTPS certificates.** Python from python.org on a Mac doesn't use the
+  macOS Keychain; it starts with an empty store of its own. The app loads the
+  **Keychain** itself (Apple's `/usr/bin/security`: system roots, the System
+  keychain where IT installs company CAs, and your login keychain), so it
+  trusts what Safari and curl trust. You don't need "Install Certificates" or
+  any pip package. The startup log shows what it trusts, e.g.
+  `HTTPS trusts: macOS Keychain (180 certificates)`.
+- **"Couldn't verify the HTTPS certificate…":** the message names who issued
+  the certificate your network presented. If it's your company (Zscaler,
+  Netskope, Palo Alto, a corporate CA), a proxy is inspecting HTTPS and its root
+  CA isn't in your keychain. Ask IT to install it, or save it as a `.pem` and
+  start the app with `SSL_CERT_FILE=/path/to/ca.pem`. Certificate checks are
+  never turned off.
 - To run the **bundle** on a Mac, build it with `darwin_arm64` (Apple Silicon)
   and/or `darwin_amd64` (Intel) ticked on the Platforms screen. The app itself
   runs either way.
@@ -336,7 +344,7 @@ terraform {
   manages the temporary local backend, turns plan JSON into a tree, and builds
   attribute diffs.
 - `plan_view.py`: the Plan Explorer screen (map/list, details, problems).
-- `tf_locate.py`: finds `terraform` / `gpg` (terminal PATH → login shell → common folders → bundle).
+- `tf_locate.py`: finds `terraform` / `gpg` (terminal PATH → macOS `/etc/paths` → common folders → bundle). Runs once, off the UI thread, and never starts a shell.
 - `Run Terraform Porter.bat` / `.command` / `run-terraform-porter.sh`: Windows / macOS / Linux launchers.
 - `tests/`: `python -m unittest discover -s tests`. These run offline. They include
   a multi-provider fixture (tls/time/null/cloudinit, an implied provider, a

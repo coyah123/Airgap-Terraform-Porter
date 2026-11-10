@@ -45,7 +45,7 @@ class TerraformOnPath(unittest.TestCase):
         fake = fake_terraform(self.dir, "9.9.9")
         path = str(self.dir) + os.pathsep + os.environ.get("PATH", "")
         with mock.patch.dict(os.environ, {"PATH": path}):
-            first = tf_locate.find_all()[0]
+            first = tf_locate.find_all(refresh=True)[0]
             best = tf_locate.default_terraform()
         self.assertEqual(Path(first.path).resolve(), fake.resolve())
         self.assertEqual((first.source, first.version), ("PATH", "9.9.9"))
@@ -61,18 +61,40 @@ class TerraformOnPath(unittest.TestCase):
         exe = b / tf_locate.EXE
         real.rename(exe) if real != exe else None
         with mock.patch.dict(os.environ, {"PATH": ""}), \
-                mock.patch.object(tf_locate, "login_shell_path", lambda: ""), \
+                mock.patch.object(tf_locate, "system_path", lambda: ""), \
                 mock.patch.object(tf_locate, "_common_dirs", lambda name: []):
-            cands = tf_locate.find_all(bundle, host)
+            cands = tf_locate.find_all(bundle, host, refresh=True)
         self.assertEqual([c.source for c in cands], ["bundle"])
 
-    def test_login_shell_used_when_path_is_minimal(self):
+    def test_system_path_used_when_path_is_minimal(self):
         fake = fake_terraform(self.dir, "1.15.0")
         with mock.patch.dict(os.environ, {"PATH": ""}), \
-                mock.patch.object(tf_locate, "login_shell_path", lambda: str(self.dir)), \
+                mock.patch.object(tf_locate, "system_path", lambda: str(self.dir)), \
                 mock.patch.object(tf_locate, "_common_dirs", lambda name: []):
-            c = tf_locate.find_all()[0]
-        self.assertEqual((Path(c.path).resolve(), c.source), (fake.resolve(), "shell"))
+            c = tf_locate.find_all(refresh=True)[0]
+        self.assertEqual((Path(c.path).resolve(), c.source), (fake.resolve(), "system"))
+
+    def test_never_starts_a_shell(self):
+        """Regression: detection must not spawn $SHELL (it ran ~/.zshrc on macOS)."""
+        seen = []
+        real = tf_locate.subprocess.run
+
+        def spy(argv, *a, **k):
+            seen.append(argv)
+            return real(argv, *a, **k)
+        with mock.patch.object(tf_locate.subprocess, "run", spy):
+            tf_locate.find_all(refresh=True)
+            tf_locate.find_gpg.cache_clear()
+            tf_locate.find_gpg()
+        shells = [a for a in seen if Path(str(a[0])).name in ("sh", "bash", "zsh", "fish")]
+        self.assertEqual(shells, [])
+        self.assertTrue(all(a[1:] == ["version", "-json"] for a in seen), seen)
+
+    def test_macos_system_path_reads_etc_paths(self):
+        tf_locate.system_path.cache_clear()
+        with mock.patch.object(tf_locate.sys, "platform", "linux"):
+            self.assertEqual(tf_locate.system_path(), "")
+        tf_locate.system_path.cache_clear()
 
     def test_unrunnable_binary_has_no_version(self):
         junk = self.dir / "terraform.exe"

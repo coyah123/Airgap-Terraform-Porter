@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+# built bundles (hundreds of MB of binaries) — carry them, don't commit them
+*-bundle/
+*.zip
+*.part

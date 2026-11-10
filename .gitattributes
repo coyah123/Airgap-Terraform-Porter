@@ -1,0 +1,8 @@
+# Unix scripts must stay LF or bash on macOS/Linux fails on the \r.
+*.sh       text eol=lf
+*.command  text eol=lf
+*.py       text eol=lf
+*.md       text eol=lf
+*.bat      text eol=crlf
+*.json     text eol=lf
+*.tf       text eol=lf
